@@ -14,13 +14,7 @@ from bytelatent.data.patcher import calculate_entropies
 from bytelatent.entropy_model import load_entropy_model
 from bytelatent.tokenizers.build_tokenizer import TokenizerArgs
 
-
 def get_id_key(doc: dict) -> int:
-    """
-    We need a reliable way to ensure that samples from jsonl
-    and arrow are the same, but there is no unique id field,
-    so derive the best possible
-    """
     if "sample_id" in doc:
         return "sample_id"
     elif "title" in doc:
@@ -38,15 +32,8 @@ def get_id_key(doc: dict) -> int:
     else:
         raise ValueError(f"Could not find a id key from: {doc.keys()}")
 
-
 def get_id_from_doc(doc: dict) -> int:
-    """
-    We need a reliable way to ensure that samples from jsonl
-    and arrow are the same, but there is no unique id field,
-    so derive the best possible
-    """
     return str(doc[get_id_key(doc)])
-
 
 def get_text(doc: dict):
     if "text" in doc:
@@ -57,12 +44,29 @@ def get_text(doc: dict):
         raise ValueError(f"Could not find a text key from: {doc.keys()}")
     return text
 
-
 def jsonl_file_iterator(fs: fsspec.AbstractFileSystem, path: str):
     with fs.open(path) as f:
         reader = jsonlines.Reader(f)
         yield from reader
 
+def extract_sentence_boundaries(doc):
+    """
+    Extract sentence boundary indices from the document if available.
+    This should be provided in the data, for example as a field 'sentences' containing a list of sentences.
+    Each sentence is a list of words.
+    Returns a list of indices (first word of each sentence in the flattened word list).
+    """
+    if "sentences" in doc:
+        sentences = doc["sentences"]
+        starts = []
+        idx = 0
+        for sentence in sentences:
+            starts.append(idx)
+            idx += len(sentence)
+        return starts
+    else:
+        # If sentence annotation not present, treat whole text as one sentence
+        return [0]
 
 def main(
     input_file: str,
@@ -102,7 +106,8 @@ def main(
     entropy_field = pa.field("entropies", pa.list_(pa.float16()), nullable=False)
     sample_id_field = pa.field("sample_id", pa.string(), nullable=False)
     text_field = pa.field("text", pa.string(), nullable=False)
-    schema = pa.schema([sample_id_field, text_field, entropy_field])
+    sentence_starts_field = pa.field("sentence_starts", pa.list_(pa.int32()), nullable=False)
+    schema = pa.schema([sample_id_field, text_field, entropy_field, sentence_starts_field])
     arrow_batch_size = 1_000
 
     output_fs = get_fs(output_file, s3_profile=s3_profile)
@@ -113,6 +118,7 @@ def main(
                 id_buffer = []
                 entropies_buffer = []
                 text_buffer = []
+                sentence_starts_buffer = []
                 with Progress(
                     *Progress.get_default_columns(),
                     TextColumn("Completed: {task.completed}"),
@@ -123,7 +129,11 @@ def main(
                     for doc in input_doc_iterator:
                         sample_id = get_id_from_doc(doc)
                         text = get_text(doc)
-                        tokens = torch.tensor(tokenizer.encode(text))
+                        # Can use sentence annotations
+                        sentence_starts = extract_sentence_boundaries(doc)
+                        # Tokenize to word-level
+                        words = text.strip().split() # to use a smarter tokenizer
+                        tokens = torch.tensor(tokenizer.encode(" ".join(words)))
                         patch_start = time.time()
                         scores, _ = calculate_entropies(
                             tokens,
@@ -136,12 +146,14 @@ def main(
                         )
                         id_buffer.append(sample_id)
                         text_buffer.append(text)
+                        sentence_starts_buffer.append(sentence_starts)
                         if len(entropies_buffer) == arrow_batch_size:
                             batch = pa.record_batch(
                                 {
                                     "entropies": entropies_buffer,
                                     "sample_id": id_buffer,
                                     "text": text_buffer,
+                                    "sentence_starts": sentence_starts_buffer,
                                 },
                                 schema,
                             )
@@ -149,18 +161,19 @@ def main(
                             entropies_buffer = []
                             id_buffer = []
                             text_buffer = []
+                            sentence_starts_buffer = []
                         patch_time += time.time() - patch_start
                         step += 1
                         if step % log_step == 0:
                             print("Completed steps:", step)
                         progress.update(task, advance=1)
                     if len(entropies_buffer) > 0:
-                        # Write last things
                         batch = pa.record_batch(
                             {
                                 "entropies": entropies_buffer,
                                 "sample_id": id_buffer,
                                 "text": text_buffer,
+                                "sentence_starts": sentence_starts_buffer,
                             },
                             schema,
                         )
@@ -168,6 +181,7 @@ def main(
                         entropies_buffer = []
                         id_buffer = []
                         text_buffer = []
+                        sentence_starts_buffer = []
         output_fs.touch(f"{output_file}.complete")
     except:
         if output_fs.exists(output_file):
@@ -176,7 +190,6 @@ def main(
     elapsed = time.time() - start_time
     print("steps", step)
     print("done in:", elapsed)
-
 
 if __name__ == "__main__":
     typer.run(main)
