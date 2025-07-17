@@ -25,6 +25,7 @@ class PatchingModeEnum(str, Enum):
     space = "space"
     static = "static"
     byte = "byte"
+    sentence = "sentence"  # NEW: Added for sentence-based patching
 
 
 class PatcherArgs(BaseModel):
@@ -505,6 +506,7 @@ class Patcher:
         if self.log_time:
             self.log = defaultdict(float)
 
+     # --- CHANGE: Added sentence_starts argument and logic for sentence mode ---
     def patch(
         self,
         tokens: torch.Tensor,
@@ -512,6 +514,7 @@ class Patcher:
         preds: torch.Tensor | None = None,
         entropies: torch.Tensor | None = None,
         threshold: float = None,
+        sentence_starts: list[list[int]] | None = None,  # NEW: Added for sentence patching
     ) -> torch.Tensor:
         """
         tokens: 2D tensor of shape [batch_size, seq_len] that needs to be patched
@@ -532,14 +535,15 @@ class Patcher:
             use space like tokens to define the patches.
         4. patching_mode = "bpe":
             use bpe delim tokens to define the patches.
-
-        To correctly patch the last token, it may be necessary to include the next token in the patch
-        lengths calculations. This is controlled by the include_next_token argument.
+        5. patching_mode = "sentence":
+            NEW: use sentence_starts indices to define patch boundaries.
+            Each sentence maps to a patch (segment).
         """
         bs, seq_len = tokens.shape
         seq_len_next_tok = seq_len + 1 if include_next_token else seq_len
         scores = None
-        # STATIC
+
+        # STATIC PATCHING
         if self.patching_mode == PatchingModeEnum.static:
             patch_lengths = torch.zeros(
                 (bs, math.ceil(seq_len_next_tok / self.patch_size)),
@@ -548,11 +552,12 @@ class Patcher:
             ).fill_(self.patch_size)
             if seq_len_next_tok % self.patch_size != 0:
                 patch_lengths[:, -1] = seq_len_next_tok % self.patch_size
+        # BYTE PATCHING
         elif self.patching_mode == PatchingModeEnum.byte:
             patch_lengths = torch.ones(
                 (bs, seq_len_next_tok), dtype=tokens.dtype, device=tokens.device
             )
-        # ENTROPY
+        # ENTROPY PATCHING
         elif self.patching_mode == PatchingModeEnum.entropy:
             if self.log_time:
                 s = time.time()
@@ -588,7 +593,7 @@ class Patcher:
             if self.log_time:
                 self.log["patch_lengths_from_start_ids"] += time.time() - s
                 s = time.time()
-        # BPE
+        # BPE PATCHING
         elif self.patching_mode == PatchingModeEnum.bpe:
             patch_start_ids = find_bpe_delim_patch_start_ids(tokens, delim=BPE_ID)
             patch_lengths = patch_lengths_from_start_ids(
@@ -605,12 +610,30 @@ class Patcher:
             patch_lengths = patch_lengths_from_start_ids(
                 patch_start_ids, seq_len_next_tok
             )
-        # SPACE
+        # SPACE PATCHING
         elif self.patching_mode == PatchingModeEnum.space:
             patch_start_ids = find_space_patch_start_ids(tokens)
             patch_lengths = patch_lengths_from_start_ids(
                 patch_start_ids, seq_len_next_tok
             )
+        # --- CHANGE: Sentence boundary patching mode ---
+        elif self.patching_mode == PatchingModeEnum.sentence:
+            # NEW: Patch boundaries defined by sentence_starts indices
+            # sentence_starts should be a list of lists (batch), each with sorted indices
+            # Previously: No sentence-based segmentation
+            # Now: Each sentence boundary defines a patch/piece
+            assert sentence_starts is not None, \
+                "sentence_starts must be provided for sentence patching mode"
+            patch_start_ids = []
+            for starts in sentence_starts:
+                ids = [0] + [i for i in starts if i != 0] # Always include 0 as start
+                patch_start_ids.append(ids)
+            # Pad all to same length
+            max_len = max(len(ids) for ids in patch_start_ids)
+            patch_start_ids = [rightpad(ids, seq_len_next_tok, max_len) for ids in patch_start_ids]
+            patch_start_ids = torch.tensor(patch_start_ids, dtype=tokens.dtype, device=tokens.device)
+            patch_lengths = patch_lengths_from_start_ids(patch_start_ids, seq_len_next_tok)
+        # --- END CHANGE ---
         else:
             raise NotImplementedError(f"self.patching_mode {self.patching_mode}")
 
@@ -627,11 +650,9 @@ class Patcher:
                 patch_lengths, dtype=tokens.dtype, device=tokens.device
             )
         assert not check_non_zero_after_zero(patch_lengths)
-        # Find the last non-zero column index using argmax on a reversed version of the tensor
         last_non_zero_col_reversed = (
             (patch_lengths != 0).flip(dims=[1]).int().argmax(dim=1).min()
         )
-        # Slice the tensor up to the last non-zero column
         patch_lengths = patch_lengths[
             :, : patch_lengths.shape[1] - last_non_zero_col_reversed
         ]
