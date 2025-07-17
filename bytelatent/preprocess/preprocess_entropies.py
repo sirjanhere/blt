@@ -52,8 +52,8 @@ def jsonl_file_iterator(fs: fsspec.AbstractFileSystem, path: str):
 def extract_sentence_boundaries(doc):
     """
     Extract sentence boundary indices from the document if available.
-    This should be provided in the data, for example as a field 'sentences' containing a list of sentences.
-    Each sentence is a list of words.
+    If 'sentences' is present, use ground-truth.
+    Otherwise, use Trankit or DeepSegment for automatic sentence segmentation.
     Returns a list of indices (first word of each sentence in the flattened word list).
     """
     if "sentences" in doc:
@@ -64,9 +64,44 @@ def extract_sentence_boundaries(doc):
             starts.append(idx)
             idx += len(sentence)
         return starts
-    else:
-        # If sentence annotation not present, treat whole text as one sentence
-        return [0]
+
+    # Try to use Trankit (preferred) for automatic segmentation
+    try:
+        from trankit import Pipeline
+        p = Pipeline('english')
+        text = doc.get("text") or doc.get("content", "")
+        # Trankit returns list of sentence strings
+        sents = p.split_sentences(text)
+        words = text.strip().split()
+        starts = []
+        idx = 0
+        for sent in sents:
+            sent_words = sent.strip().split()
+            starts.append(idx)
+            idx += len(sent_words)
+        return starts
+    except ImportError:
+        pass  # Fallback below if Trankit not available
+
+    # Fallback: DeepSegment (if installed)
+    try:
+        from deepsegment import DeepSegment
+        segmenter = DeepSegment('en')
+        text = doc.get("text") or doc.get("content", "")
+        sents = segmenter.segment_long(text)
+        words = text.strip().split()
+        starts = []
+        idx = 0
+        for sent in sents:
+            sent_words = sent.strip().split()
+            starts.append(idx)
+            idx += len(sent_words)
+        return starts
+    except ImportError:
+        pass
+
+    # If all else fails, treat whole text as one sentence
+    return [0]
 
 def main(
     input_file: str,
