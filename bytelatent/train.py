@@ -66,7 +66,8 @@ from bytelatent.transformer import (
     get_num_flop_per_token,
     tp_parallelize,
 )
-
+# Import Patcher for sentence boundary training
+from bytelatent.data.patcher import Patcher, PatcherArgs, PatchingModeEnum
 logger = logging.getLogger()
 
 T = TypeVar("T")
@@ -471,12 +472,44 @@ def train(args: TrainArgs):
 
             if args.train_entropy_model:
                 pred = model(batch_x)
+                # --------- CHANGE: Build binary targets for sentence boundary detection ---------
+                # batch.sentence_starts should be a list of lists, one per batch element
+                batch_entropy_targets = torch.zeros_like(pred)
+                for i, starts in enumerate(batch.sentence_starts):
+                    for idx in starts:
+                        if idx < pred.shape[1]:  # protect against overflow
+                            batch_entropy_targets[i, idx] = 1.0
+                # Use binary cross entropy loss for sentence boundary detection
+                loss = F.binary_cross_entropy_with_logits(pred, batch_entropy_targets)
+                tok_loss = F.binary_cross_entropy_with_logits(pred, batch_entropy_targets, reduction="none")
+                #  Compute F1, Precision, Recall for sentence boundary detection 
+                with torch.no_grad():
+                    # Predict boundaries: threshold sigmoid output
+                    pred_boundaries = (torch.sigmoid(pred) > 0.5).int()
+                    target_boundaries = batch_entropy_targets.int()
+
+                    # Flatten for metric computation
+                    pred_flat = pred_boundaries.flatten()
+                    target_flat = target_boundaries.flatten()
+
+                    TP = ((pred_flat == 1) & (target_flat == 1)).sum().item()
+                    FP = ((pred_flat == 1) & (target_flat == 0)).sum().item()
+                    FN = ((pred_flat == 0) & (target_flat == 1)).sum().item()
+
+                    precision = TP / (TP + FP + 1e-8)
+                    recall = TP / (TP + FN + 1e-8)
+                    f1 = 2 * precision * recall / (precision + recall + 1e-8)
+
+                    # Log metrics
+                    logger.info(f"Sentence boundary metrics: Precision={precision:.4f}, Recall={recall:.4f}, F1={f1:.4f}")
+                        metrics["sentence_boundary/precision"] = precision
+                        metrics["sentence_boundary/recall"] = recall
+                        metrics["sentence_boundary/f1"] = f1
             else:
                 pred = model(
                     batch_x, patch_lengths=batch_patch_lengths, ngram_ids=ngram_ids
                 )
-
-            loss, tok_loss = compute_loss(pred, batch_y, mask, train_state.scale)
+                loss, tok_loss = compute_loss(pred, batch_y, mask, train_state.scale)
 
             # We scale loss with grad_acc_steps so the gradient is the same
             # regardless of grad_acc_steps
