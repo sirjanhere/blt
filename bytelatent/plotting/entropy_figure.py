@@ -28,6 +28,18 @@ class PlotEntropiesData(BaseModel):
     class Config:
         extra = "forbid"
 
+# --- ADDED: Helper function to compute metrics ---
+def compute_metrics(df):
+    # True positives (TP): predicted AND ground truth
+    tp = ((df['predicted_start'] == 1) & (df['ground_truth_start'] == 1)).sum()
+    # False positives (FP): predicted but not ground truth
+    fp = ((df['predicted_start'] == 1) & (df['ground_truth_start'] == 0)).sum()
+    # False negatives (FN): not predicted but ground truth
+    fn = ((df['predicted_start'] == 0) & (df['ground_truth_start'] == 1)).sum()
+    precision = tp / (tp + fp + 1e-8)
+    recall = tp / (tp + fn + 1e-8)
+    f1 = 2 * precision * recall / (precision + recall + 1e-8)
+    return precision, recall, f1, tp, fp, fn
 
 def main():
     config_path = sys.argv[1]
@@ -53,7 +65,20 @@ def main():
             scores = json.load(f)["score"]
             assert len(scores) == len(df)
             df["entropies"] = scores
-            df["start"] = [1] + (df["entropies"] > threshold).values.tolist()[:-1]
+            # Use entropy thresholding for predicted boundaries
+            df["predicted_start"] = [1] + (df["entropies"] > threshold).values.tolist()[:-1]
+    else:
+        # If not overridden, try to use a "predicted_start" column if it exists, else create it from threshold
+        if "predicted_start" not in df.columns:
+            df["predicted_start"] = [1] + (df["entropies"] > threshold).values.tolist()[:-1]
+
+    # --- ADDED: Ensure 'ground_truth_start' exists ---
+    if "ground_truth_start" not in df.columns:
+        raise ValueError("Dataframe must contain 'ground_truth_start' column marking sentence starts.")
+
+    # --- ADDED: Compute metrics ---
+    precision, recall, f1, tp, fp, fn = compute_metrics(df)
+    print(f"Precision: {precision:.4f}  Recall: {recall:.4f}  F1: {f1:.4f}  TP: {tp}  FP: {fp}  FN: {fn}")
 
     x_ticks = []
     for row in df.itertuples():
@@ -70,8 +95,11 @@ def main():
         labelAngle=0,
     )
     width = 1200
-    height = 150
+    height = 220  # increased for annotation room
+
     base = alt.Chart(df).properties(width=width, height=height)
+
+    # Entropy line with points
     points = base.mark_line(point=True).encode(
         x=alt.X("position_with_token:O", title=None, axis=x_axis),
         y=alt.Y(
@@ -79,17 +107,39 @@ def main():
             title="Entropy of Next Byte",
         ),
     )
+
+    # Entropy threshold line
     rule = base.mark_rule(color="red", strokeDash=[4, 4]).encode(
         y=alt.datum(threshold),
     )
-    patch_rules = (
-        alt.Chart(df[df["start"] > 0])
-        .properties(width=width, height=height)
-        .mark_rule(color="#474747", strokeDash=[4, 2])
+
+    # --- CHANGED: Patch rules (predicted boundary starts) are now blue dashed ---
+    pred_rules = (
+        alt.Chart(df[df["predicted_start"] > 0])
+        .mark_rule(color="blue", strokeDash=[4, 2])
+        .encode(x=alt.X("position_with_token:O", axis=x_axis))
+    )
+    # --- ADDED: Ground truth sentence starts, green solid ---
+    gt_rules = (
+        alt.Chart(df[df["ground_truth_start"] > 0])
+        .mark_rule(color="green", strokeDash=[1, 0])
         .encode(x=alt.X("position_with_token:O", axis=x_axis))
     )
 
-    chart = patch_rules + rule + points
+    # --- ADDED: Text annotation for F1, precision, recall ---
+    text = alt.Chart(pd.DataFrame({
+        'text': [f'F1: {f1:.3f}   Precision: {precision:.3f}   Recall: {recall:.3f}'],
+        'x': [0], 'y': [df['entropies'].max() + 0.3]  # place above the highest entropy
+    })).mark_text(
+        align='left', baseline='top', fontSize=18, color="black"
+    ).encode(
+        x=alt.value(10),  # pixels from left
+        y=alt.value(10),  # pixels from top
+        text='text'
+    )
+
+    # Combine all chart elements
+    chart = gt_rules + pred_rules + rule + points + text
     chart = chart.configure_axis(labelFontSize=15, titleFontSize=15)
     path = Path(plot_config.chart_path)
     path.parent.mkdir(exist_ok=True)
