@@ -1,6 +1,10 @@
 import re
 import pickle
 from pathlib import Path
+import spacy
+
+nlp = spacy.load("en_core_web_sm")
+nlp.max_length = 4_000_000 
 
 def get_punct_sentences(text):
     # Remove Gutenberg header/footer
@@ -8,8 +12,10 @@ def get_punct_sentences(text):
     main_text = re.split(r"\*{3} END OF.*? \*{3}", main_text, flags=re.DOTALL)[0]
     # Remove empty lines
     main_text = "\n".join([line for line in main_text.split('\n') if line.strip()])
-    # Split on sentence-ending punctuation followed by whitespace and a capital letter
-    sents = re.split(r"(?<=[\.\!\?])[\s\"\']+(?=[A-ZА-ЯЁ])", main_text)
+    # Use spaCy's sentence tokenizer
+    doc = nlp(main_text)
+    sents = [sent.text for sent in doc.sents]
+    return sents
     return sents
 
 def label_sentence_starts_unpunct(sents):
